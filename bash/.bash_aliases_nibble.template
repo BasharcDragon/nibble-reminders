@@ -1,10 +1,327 @@
-# Template version (sanitize before sharing):
-# - Replace NIBBLE_TO with your own Discord user id target.
-# - Ensure SSH to your remote host works (key-based).
-# - Source this from ~/.bash_aliases or ~/.bashrc.
+# =========================
+# NIBBLE (Clawdbot) HELPERS
+# =========================
 
 export NIBBLE_TO="user:YOUR_DISCORD_USER_ID"
 export NIBBLE_ALARM_SOUND="${NIBBLE_ALARM_SOUND:-/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga}"
+export NIBBLE_STATE_FILE="${NIBBLE_STATE_FILE:-${HOME}/.clawdbot/nibble_state.env}"
 export NIBBLE_VEGA_LOG="${NIBBLE_VEGA_LOG:-${HOME}/.clawdbot/nibble_vega_alarm.log}"
 
-# NOTE: This repo ships the template; paste your working functions here from your local setup.
+# -------------------------
+# Internal state helpers
+# -------------------------
+_nibble_set_last () {
+  mkdir -p "$(dirname "$NIBBLE_STATE_FILE")"
+  touch "$NIBBLE_STATE_FILE"
+
+  local tmp key kv val
+  tmp="$(mktemp)"
+  cp "$NIBBLE_STATE_FILE" "$tmp"
+
+  for kv in "$@"; do
+    key="${kv%%=*}"
+    val="${kv#*=}"
+
+    grep -v "^${key}=" "$tmp" > "${tmp}.new" 2>/dev/null || true
+    mv "${tmp}.new" "$tmp"
+
+    printf '%s=%q\n' "$key" "$val" >> "$tmp"
+  done
+
+  mv "$tmp" "$NIBBLE_STATE_FILE"
+}
+
+_nibble_get_last () {
+  [[ -f "$NIBBLE_STATE_FILE" ]] || return 0
+  # shellcheck disable=SC1090
+  source "$NIBBLE_STATE_FILE"
+}
+
+_nibble_clear_last () {
+  _nibble_set_last \
+    "LAST_POLARIS_UNIT=" \
+    "LAST_VEGA_HOST=" \
+    "LAST_VEGA_PID=" \
+    "LAST_VEGA_UNIT=" \
+    "LAST_TASK=" \
+    "LAST_WHEN=" \
+    "LAST_WHERE="
+}
+
+# -------------------------
+# DM reminder via Nibble
+# -------------------------
+nibble-remind () {
+  local when="$1"; shift
+  local msg="$*"
+
+  clawdbot cron add \
+    --name "reminder-$(date +%s)" \
+    --at "$when" \
+    --session isolated \
+    --message "$msg" \
+    --deliver \
+    --channel discord \
+    --to "$NIBBLE_TO" \
+    --wake now \
+    --delete-after-run
+}
+
+# -------------------------
+# Local alarm (Polaris)
+# -------------------------
+_nibble_alarm_local () {
+  local when="$1"; shift
+  local task="$*"
+  local sound="${NIBBLE_ALARM_SOUND}"
+  local unit="nibble-alarm-local-$(date +%s)"
+
+  local task_q sound_q
+  task_q="$(printf %q "$task")"
+  sound_q="$(printf %q "$sound")"
+
+  if [[ "$when" =~ ^[0-9]+[smhd]$ ]]; then
+    systemd-run --user --unit="$unit" --on-active="$when" \
+      --timer-property=AccuracySec=1s --timer-property=RandomizedDelaySec=0 \
+      bash -lc "notify-send \"Nibble reminder\" $task_q >/dev/null 2>&1 || true; paplay $sound_q >/dev/null 2>&1 || true"
+  else
+    systemd-run --user --unit="$unit" --on-calendar="$when" \
+      --timer-property=AccuracySec=1s --timer-property=RandomizedDelaySec=0 \
+      bash -lc "notify-send \"Nibble reminder\" $task_q >/dev/null 2>&1 || true; paplay $sound_q >/dev/null 2>&1 || true"
+  fi
+
+  printf '%s\n' "$unit"
+}
+
+# -------------------------
+# Remote alarm (Vega)
+# Relative times: schedule a POLARIS systemd timer that SSH'es Vega at fire-time.
+# Absolute times: schedule Vega systemd timer.
+# Returns: "unit:<UNIT>"
+# -------------------------
+_nibble_alarm_remote () {
+  local host="$1"; shift
+  local when="$1"; shift
+  local task="$*"
+  local sound="${NIBBLE_ALARM_SOUND}"
+
+  mkdir -p "$(dirname "$NIBBLE_VEGA_LOG")"
+
+  # Relative delay -> schedule local timer to fire SSH at the right time
+  if [[ "$when" =~ ^([0-9]+)([smhd])$ ]]; then
+    local n="${BASH_REMATCH[1]}"
+    local u="${BASH_REMATCH[2]}"
+    local sec=0
+    case "$u" in
+      s) sec=$((n)) ;;
+      m) sec=$((n*60)) ;;
+      h) sec=$((n*3600)) ;;
+      d) sec=$((n*86400)) ;;
+    esac
+
+    local unit="nibble-vega-rel-$(date +%s)"
+    local script="${HOME}/.clawdbot/${unit}.sh"
+
+    cat > "$script" <<'SCRIPT'
+#!/usr/bin/env bash
+set -u
+
+HOST="$1"
+TASK="$2"
+SOUND="$3"
+LOG="${HOME}/.clawdbot/nibble_vega_alarm.log"
+
+{
+  echo "=== POLARIS fire $(date) ==="
+  echo "host=$HOST"
+  echo "task=[$TASK]"
+  echo "sound=[$SOUND]"
+} >> "$LOG"
+
+# Pass TASK/SOUND via environment variables (no positional-arg weirdness on remote)
+task_q="$(printf %q "$TASK")"
+sound_q="$(printf %q "$SOUND")"
+
+ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
+  "TASK=$task_q SOUND=$sound_q bash -s" <<'REMOTE' >> "$LOG" 2>&1
+
+set -u
+
+echo "=== VEGA start $(date) user=$(whoami) host=$(hostname) ==="
+echo "REMOTE: TASK=[$TASK]"
+echo "REMOTE: SOUND=[$SOUND]"
+
+uid="$(id -u)"
+export XDG_RUNTIME_DIR="/run/user/$uid"
+export PULSE_SERVER="unix:${XDG_RUNTIME_DIR}/pulse/native"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+
+echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+ls -l "$XDG_RUNTIME_DIR/pulse/native" || true
+ls -l -- "$SOUND" || echo "REMOTE: sound path missing"
+
+notify-send "Nibble reminder" "$TASK" >/dev/null 2>&1 || echo "notify-send failed"
+paplay -- "$SOUND" || echo "paplay failed rc=$?"
+
+echo "=== VEGA end $(date) ==="
+REMOTE
+SCRIPT
+
+    chmod +x "$script"
+
+    systemd-run --user --unit="$unit" --on-active="${sec}s" \
+      --timer-property=AccuracySec=1s --timer-property=RandomizedDelaySec=0 \
+      "$script" "$host" "$task" "$sound" >/dev/null 2>&1
+
+    printf 'unit:%s\n' "$unit"
+    return 0
+  fi
+
+  # Absolute time -> schedule timer on Vega
+  local out unit
+  out="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" bash -s -- "$when" "$task" "$sound" <<'REMOTE'
+when="$1"
+task="$2"
+sound="$3"
+unit="nibble-alarm-remote-$(date +%s)"
+
+uid="$(id -u)"
+XDG_RUNTIME_DIR="/run/user/$uid"
+PULSE_SERVER="unix:${XDG_RUNTIME_DIR}/pulse/native"
+DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+
+task_q="$(printf %q "$task")"
+sound_q="$(printf %q "$sound")"
+
+systemd-run --user --unit="$unit" --on-calendar="$when" \
+  --timer-property=AccuracySec=1s --timer-property=RandomizedDelaySec=0 \
+  --setenv=XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+  --setenv=PULSE_SERVER="$PULSE_SERVER" \
+  --setenv=DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+  bash -lc "notify-send \"Nibble reminder\" $task_q >/dev/null 2>&1 || true; paplay $sound_q >/dev/null 2>&1 || true"
+
+echo "$unit"
+REMOTE
+  )"
+  unit="$(printf '%s' "$out" | tail -n 1)"
+  printf 'unit:%s\n' "$unit"
+}
+
+# -------------------------
+# Public commands
+# -------------------------
+nibble-alarm () {
+  local when="$1"; shift
+  local task="$*"
+
+  nibble-remind "$when" "$task" >/dev/null
+
+  local unit
+  unit="$(_nibble_alarm_local "$when" "$task")"
+
+  _nibble_set_last \
+    "LAST_POLARIS_UNIT=${unit}" \
+    "LAST_VEGA_HOST=" \
+    "LAST_VEGA_PID=" \
+    "LAST_VEGA_UNIT=" \
+    "LAST_TASK=${task}" \
+    "LAST_WHEN=${when}" \
+    "LAST_WHERE=polaris"
+}
+
+nibble-reminder-polaris () {
+  local when="$1"; shift
+  local task="$*"
+  nibble-alarm "$when" "$task"
+}
+
+nibble-reminder-vega () {
+  local when="$1"; shift
+  local task="$*"
+
+  nibble-remind "$when" "$task" >/dev/null
+
+  local rid unit
+  rid="$(_nibble_alarm_remote vega "$when" "$task")"
+  unit="${rid#unit:}"
+
+  _nibble_set_last \
+    "LAST_POLARIS_UNIT=" \
+    "LAST_VEGA_HOST=vega" \
+    "LAST_VEGA_PID=" \
+    "LAST_VEGA_UNIT=${unit}" \
+    "LAST_TASK=${task}" \
+    "LAST_WHEN=${when}" \
+    "LAST_WHERE=vega"
+}
+
+nibble-reminder-array () {
+  local when="$1"; shift
+  local task="$*"
+
+  nibble-remind "$when" "$task" >/dev/null
+
+  local local_unit rid unit
+  local_unit="$(_nibble_alarm_local "$when" "$task")"
+  rid="$(_nibble_alarm_remote vega "$when" "$task")"
+  unit="${rid#unit:}"
+
+  _nibble_set_last \
+    "LAST_POLARIS_UNIT=${local_unit}" \
+    "LAST_VEGA_HOST=vega" \
+    "LAST_VEGA_PID=" \
+    "LAST_VEGA_UNIT=${unit}" \
+    "LAST_TASK=${task}" \
+    "LAST_WHEN=${when}" \
+    "LAST_WHERE=array"
+}
+
+# Cancel last alarm
+nibble-cancel-last () {
+  _nibble_get_last
+  local did=0
+
+  if [[ -n "${LAST_POLARIS_UNIT:-}" ]]; then
+    systemctl --user stop "${LAST_POLARIS_UNIT}.timer" "${LAST_POLARIS_UNIT}.service" >/dev/null 2>&1 || true
+    did=1
+    echo "Cancelled Polaris alarm unit: ${LAST_POLARIS_UNIT}"
+  fi
+
+  if [[ -n "${LAST_VEGA_UNIT:-}" ]]; then
+    if [[ "${LAST_VEGA_UNIT}" == nibble-vega-rel-* ]]; then
+      systemctl --user stop "${LAST_VEGA_UNIT}.timer" "${LAST_VEGA_UNIT}.service" >/dev/null 2>&1 || true
+      did=1
+      echo "Cancelled Vega relative alarm (Polaris unit): ${LAST_VEGA_UNIT}"
+    else
+      ssh "${LAST_VEGA_HOST:-vega}" systemctl --user stop "${LAST_VEGA_UNIT}.timer" "${LAST_VEGA_UNIT}.service" >/dev/null 2>&1 || true
+      did=1
+      echo "Cancelled Vega absolute alarm (Vega unit): ${LAST_VEGA_UNIT}"
+    fi
+  fi
+
+  _nibble_clear_last
+  [[ "$did" -eq 1 ]] || echo "Nothing to cancel (no last alarm recorded)."
+}
+
+nibble-help () {
+  cat <<'HELP'
+Nibble commands (run on Polaris):
+
+DM only:
+  nibble-remind "5m" "check food"
+
+DM + alarm sound (Polaris):
+  nibble-alarm "5m" "check food"
+
+Choose where the alarm plays:
+  nibble-reminder-polaris "5m" "drink water"  # sound on Polaris
+  nibble-reminder-vega   "5m" "drink water"  # sound on Vega (fires via Polaris systemd timer)
+  nibble-reminder-array  "5m" "drink water"  # sound on BOTH
+
+Cancel the most recent alarm:
+  nibble-cancel-last
+
+Debug log for Vega ringing:
+  tail -n 200 ~/.clawdbot/nibble_vega_alarm.log
+HELP
+}
