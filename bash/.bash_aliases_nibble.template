@@ -1,0 +1,10 @@
+# Template version (sanitize before sharing):
+# - Replace NIBBLE_TO with your own Discord user id target.
+# - Ensure SSH to your remote host works (key-based).
+# - Source this from ~/.bash_aliases or ~/.bashrc.
+
+export NIBBLE_TO="user:YOUR_DISCORD_USER_ID"
+export NIBBLE_ALARM_SOUND="${NIBBLE_ALARM_SOUND:-/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga}"
+export NIBBLE_VEGA_LOG="${NIBBLE_VEGA_LOG:-${HOME}/.clawdbot/nibble_vega_alarm.log}"
+
+# NOTE: This repo ships the template; paste your working functions here from your local setup.
