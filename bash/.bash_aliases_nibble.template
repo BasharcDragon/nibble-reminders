@@ -6,6 +6,7 @@ export NIBBLE_TO="user:YOUR_DISCORD_USER_ID"
 export NIBBLE_ALARM_SOUND="${NIBBLE_ALARM_SOUND:-/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga}"
 export NIBBLE_STATE_FILE="${NIBBLE_STATE_FILE:-${HOME}/.clawdbot/nibble_state.env}"
 export NIBBLE_VEGA_LOG="${NIBBLE_VEGA_LOG:-${HOME}/.clawdbot/nibble_vega_alarm.log}"
+export NIBBLE_DEBUG="${NIBBLE_DEBUG:-0}"
 
 # -------------------------
 # Internal state helpers
@@ -68,7 +69,7 @@ nibble-remind () {
 }
 
 # -------------------------
-# Local alarm (Polaris)
+# Local alarm (SCHEDULER_HOST)
 # -------------------------
 _nibble_alarm_local () {
   local when="$1"; shift
@@ -94,9 +95,9 @@ _nibble_alarm_local () {
 }
 
 # -------------------------
-# Remote alarm (Vega)
-# Relative times: schedule a POLARIS systemd timer that SSH'es Vega at fire-time.
-# Absolute times: schedule Vega systemd timer.
+# Remote alarm (REMOTE_HOST)
+# Relative times: schedule a POLARIS systemd timer that SSH'es REMOTE_HOST at fire-time.
+# Absolute times: schedule REMOTE_HOST systemd timer.
 # Returns: "unit:<UNIT>"
 # -------------------------
 _nibble_alarm_remote () {
@@ -119,7 +120,7 @@ _nibble_alarm_remote () {
       d) sec=$((n*86400)) ;;
     esac
 
-    local unit="nibble-vega-rel-$(date +%s)"
+    local unit="nibble-remote-rel-$(date +%s)"
     local script="${HOME}/.clawdbot/${unit}.sh"
 
     cat > "$script" <<'SCRIPT'
@@ -131,19 +132,25 @@ TASK="$2"
 SOUND="$3"
 LOG="${HOME}/.clawdbot/nibble_vega_alarm.log"
 
+if [[ "${NIBBLE_DEBUG:-0}" == "1" ]]; then
+  exec >> "$LOG" 2>&1
+else
+  exec >/dev/null 2>&1
+fi
+
 {
   echo "=== POLARIS fire $(date) ==="
   echo "host=$HOST"
   echo "task=[$TASK]"
   echo "sound=[$SOUND]"
-} >> "$LOG"
+}
 
 # Pass TASK/SOUND via environment variables (no positional-arg weirdness on remote)
 task_q="$(printf %q "$TASK")"
 sound_q="$(printf %q "$SOUND")"
 
 ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
-  "TASK=$task_q SOUND=$sound_q bash -s" <<'REMOTE' >> "$LOG" 2>&1
+  "TASK=$task_q SOUND=$sound_q bash -s" <<'REMOTE'
 
 set -u
 
@@ -177,7 +184,7 @@ SCRIPT
     return 0
   fi
 
-  # Absolute time -> schedule timer on Vega
+  # Absolute time -> schedule timer on REMOTE_HOST
   local out unit
   out="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" bash -s -- "$when" "$task" "$sound" <<'REMOTE'
 when="$1"
@@ -226,33 +233,33 @@ nibble-alarm () {
     "LAST_VEGA_UNIT=" \
     "LAST_TASK=${task}" \
     "LAST_WHEN=${when}" \
-    "LAST_WHERE=polaris"
+    "LAST_WHERE=scheduler"
 }
 
-nibble-reminder-polaris () {
+nibble-reminder-scheduler () {
   local when="$1"; shift
   local task="$*"
   nibble-alarm "$when" "$task"
 }
 
-nibble-reminder-vega () {
+nibble-reminder-remote () {
   local when="$1"; shift
   local task="$*"
 
   nibble-remind "$when" "$task" >/dev/null
 
   local rid unit
-  rid="$(_nibble_alarm_remote vega "$when" "$task")"
+  rid="$(_nibble_alarm_remote remote "$when" "$task")"
   unit="${rid#unit:}"
 
   _nibble_set_last \
     "LAST_POLARIS_UNIT=" \
-    "LAST_VEGA_HOST=vega" \
+    "LAST_VEGA_HOST=remote" \
     "LAST_VEGA_PID=" \
     "LAST_VEGA_UNIT=${unit}" \
     "LAST_TASK=${task}" \
     "LAST_WHEN=${when}" \
-    "LAST_WHERE=vega"
+    "LAST_WHERE=remote"
 }
 
 nibble-reminder-array () {
@@ -263,12 +270,12 @@ nibble-reminder-array () {
 
   local local_unit rid unit
   local_unit="$(_nibble_alarm_local "$when" "$task")"
-  rid="$(_nibble_alarm_remote vega "$when" "$task")"
+  rid="$(_nibble_alarm_remote remote "$when" "$task")"
   unit="${rid#unit:}"
 
   _nibble_set_last \
     "LAST_POLARIS_UNIT=${local_unit}" \
-    "LAST_VEGA_HOST=vega" \
+    "LAST_VEGA_HOST=remote" \
     "LAST_VEGA_PID=" \
     "LAST_VEGA_UNIT=${unit}" \
     "LAST_TASK=${task}" \
@@ -284,18 +291,18 @@ nibble-cancel-last () {
   if [[ -n "${LAST_POLARIS_UNIT:-}" ]]; then
     systemctl --user stop "${LAST_POLARIS_UNIT}.timer" "${LAST_POLARIS_UNIT}.service" >/dev/null 2>&1 || true
     did=1
-    echo "Cancelled Polaris alarm unit: ${LAST_POLARIS_UNIT}"
+    echo "Cancelled SCHEDULER_HOST alarm unit: ${LAST_POLARIS_UNIT}"
   fi
 
   if [[ -n "${LAST_VEGA_UNIT:-}" ]]; then
-    if [[ "${LAST_VEGA_UNIT}" == nibble-vega-rel-* ]]; then
+    if [[ "${LAST_VEGA_UNIT}" == nibble-remote-rel-* ]]; then
       systemctl --user stop "${LAST_VEGA_UNIT}.timer" "${LAST_VEGA_UNIT}.service" >/dev/null 2>&1 || true
       did=1
-      echo "Cancelled Vega relative alarm (Polaris unit): ${LAST_VEGA_UNIT}"
+      echo "Cancelled REMOTE_HOST relative alarm (SCHEDULER_HOST unit): ${LAST_VEGA_UNIT}"
     else
-      ssh "${LAST_VEGA_HOST:-vega}" systemctl --user stop "${LAST_VEGA_UNIT}.timer" "${LAST_VEGA_UNIT}.service" >/dev/null 2>&1 || true
+      ssh "${LAST_VEGA_HOST:-remote}" systemctl --user stop "${LAST_VEGA_UNIT}.timer" "${LAST_VEGA_UNIT}.service" >/dev/null 2>&1 || true
       did=1
-      echo "Cancelled Vega absolute alarm (Vega unit): ${LAST_VEGA_UNIT}"
+      echo "Cancelled REMOTE_HOST absolute alarm (REMOTE_HOST unit): ${LAST_VEGA_UNIT}"
     fi
   fi
 
@@ -305,23 +312,23 @@ nibble-cancel-last () {
 
 nibble-help () {
   cat <<'HELP'
-Nibble commands (run on Polaris):
+Nibble commands (run on SCHEDULER_HOST):
 
 DM only:
   nibble-remind "5m" "check food"
 
-DM + alarm sound (Polaris):
+DM + alarm sound (SCHEDULER_HOST):
   nibble-alarm "5m" "check food"
 
 Choose where the alarm plays:
-  nibble-reminder-polaris "5m" "drink water"  # sound on Polaris
-  nibble-reminder-vega   "5m" "drink water"  # sound on Vega (fires via Polaris systemd timer)
+  nibble-reminder-scheduler "5m" "drink water"  # sound on SCHEDULER_HOST
+  nibble-reminder-remote   "5m" "drink water"  # sound on REMOTE_HOST (fires via SCHEDULER_HOST systemd timer)
   nibble-reminder-array  "5m" "drink water"  # sound on BOTH
 
 Cancel the most recent alarm:
   nibble-cancel-last
 
-Debug log for Vega ringing:
+Debug log for REMOTE_HOST ringing:
   tail -n 200 ~/.clawdbot/nibble_vega_alarm.log
 HELP
 }
